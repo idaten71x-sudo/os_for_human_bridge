@@ -1621,86 +1621,10 @@ async function startNewMeeting(userInput) {
   appendMinutes('user', '質問', userInput);
   appendChatLog('user', userInput);
 
-  // ═══ 画像付き → 全部CC特定ルートに直行（APIのAIは画像判定できない。修正/質問問わずdaemon経由でClaude Codeに判定させる） ═══
+  // ═══ 画像付き → 共通画像処理（CC特定ルート統一） ═══
   if (chatImages.length > 0 && serverAlive) {
-    appendChatLog('status', '📷 スクショ付き → Claude Code（daemon）に画像判定を依頼中...');
-    setPipelineStep('search', 'done');
-    setPipelineStep('facts', 'done');
-    try {
-      // CC特定ルートに画像を送信
-      const identifyRes = await fetchWithTimeout('http://localhost:5000/api/code/identify', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userText: userInput,
-          targetFile: 'os_for_human_pipeline_v3.html',
-          images: chatImages,
-        })
-      }, 10000);
-      chatImages = []; renderChatAttachments();
-
-      if (identifyRes.ok) {
-        const idData = await identifyRes.json();
-        const identifyId = idData.requestId;
-        appendChatLog('status', `📷 CC特定リクエスト送信: ${identifyId}`);
-
-        // ポーリングで結果を待つ（最大90秒）
-        let ccResult = null;
-        for (let wait = 0; wait < 90000; wait += 3000) {
-          await new Promise(r => setTimeout(r, 3000));
-          try {
-            const rr = await fetchWithTimeout(`http://localhost:5000/api/code/identify/${identifyId}`, {}, 3000);
-            if (rr.ok) {
-              ccResult = await rr.json();
-              if (ccResult.screenState || ccResult.suggestedAction) break;
-            }
-          } catch(e) {}
-          if (wait % 15000 === 0 && wait > 0) {
-            appendChatLog('status', `📷 画像判定中... (${Math.round(wait/1000)}秒経過)`);
-          }
-        }
-
-        if (ccResult && (ccResult.screenState || ccResult.suggestedAction)) {
-          // Claude Codeの判定結果をAIに渡して議事録に回答させる
-          const ccReport = `【Claude Codeの画像判定結果（実ファイルを確認した事実）】
-画面状態: ${ccResult.screenState || '不明'}
-表示テキスト: ${ccResult.visibleText || '不明'}
-ユーザーの意図: ${ccResult.userIntent || '不明'}
-推奨アクション: ${ccResult.suggestedAction || '不明'}
-${ccResult.matched ? '特定対象: ' + ccResult.matched : ''}`;
-
-          // CC判定結果のtargetFuncを使ってコードコンテキストも取得（AIが実コードを見て回答できるようにする）
-          const ccTargetFunc = ccResult.targetFunc || '';
-          const ccSearchInput = ccTargetFunc ? `${userInput} ${ccTargetFunc}` : userInput;
-          _codeContext = await gatherCodeContext(ccSearchInput);
-
-          // AIにCC結果 + 実コードを見せて回答を作らせる
-          const provider = pickProvider(['claude', 'gpt', 'gemini']);
-          showTyping(provider);
-          const sp = buildMeetingSystemPrompt(session.minutes, userInput, provider, null);
-          const response = await callAI(provider, sp, `${ccReport}\n${ccTargetFunc ? '（内部参照: ' + ccTargetFunc + '）' : ''}\n\nユーザー入力: ${userInput}\n\n【回答ルール — 絶対守れ】
-1. 上記のClaude Code判定結果は実ファイルを確認した事実。これを元に回答しろ
-2. ユーザーはド素人。関数名・行番号・変数名・daemon・Python・API等の技術用語は絶対に使うな
-3. 「ここのボタン」「この機能」「裏の仕組み」等の素人語で説明しろ
-4. 回答構造: ①何が起きてるか（1行）→ ②なぜそうなったか（1行）→ ③どうするか（修正するなら「直すわ」、調査なら「調べてみる」）
-5. 修正が必要と判断したら、diagnosisブロックにinstruction（技術的な修正指示）を入れろ。instructionの中だけ技術用語OK`, []);
-          hideTyping();
-          const diagnosis = extractDiagnosis(response);
-          appendMinutes(provider, '回答', stripDiagnosisBlock(response));
-          appendChatLog('ai', stripDiagnosisBlock(response), provider);
-
-          // code_fixなら実行
-          if (diagnosis && (diagnosis.taskType === 'code_fix' || diagnosis.taskType === 'orchestrate')) {
-            await executeCodeFix(diagnosis);
-          }
-          _chatBusy = false;
-          return;
-        } else {
-          appendChatLog('status', '📷 画像判定タイムアウト → 通常フローにフォールバック');
-        }
-      }
-    } catch(e) {
-      appendChatLog('status', `📷 CC特定失敗: ${e.message} → 通常フローにフォールバック`);
-    }
+    const handled = await handleImageInput(userInput, session, null);
+    if (handled) { _chatBusy = false; return; }
   }
 
   // パイプライン: 過去ログ検索
@@ -2096,63 +2020,12 @@ async function continueSession(userInput) {
       }
     } catch(e) {}
 
-    // ═══ 画像付き → 全部CC特定ルートに送信（修正/質問問わず。APIのAIは画像判定が弱い） ═══
+    // ═══ 画像付き → 共通画像処理（CC特定ルート統一） ═══
     if (chatImages.length > 0) {
       appendMinutes('user', '画像付き質問', userInput, '', threadId);
       appendChatLog('user', userInput);
-      appendChatLog('status', '📷 スクショ付き → daemon画像判定に依頼中...');
-      try {
-        const identifyRes = await fetchWithTimeout('http://localhost:5000/api/code/identify', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ userText: userInput, targetFile: 'os_for_human_pipeline_v3.html', images: chatImages })
-        }, 10000);
-        chatImages = []; renderChatAttachments();
-
-        if (identifyRes.ok) {
-          const idData = await identifyRes.json();
-          appendChatLog('status', `📷 CC特定リクエスト送信: ${idData.requestId}`);
-
-          // ポーリングで結果を待つ（最大90秒）
-          let ccResult = null;
-          for (let wait = 0; wait < 90000; wait += 3000) {
-            await new Promise(r => setTimeout(r, 3000));
-            try {
-              const rr = await fetchWithTimeout(`http://localhost:5000/api/code/identify/${idData.requestId}`, {}, 3000);
-              if (rr.ok) { ccResult = await rr.json(); if (ccResult.screenState || ccResult.suggestedAction) break; }
-            } catch(e) {}
-            if (wait % 15000 === 0 && wait > 0) appendChatLog('status', `📷 画像判定中... (${Math.round(wait/1000)}秒経過)`);
-          }
-
-          if (ccResult && (ccResult.screenState || ccResult.suggestedAction)) {
-            const ccReport = `【Claude Codeの画像判定結果（実ファイルを確認した事実）】\n画面状態: ${ccResult.screenState || '不明'}\n表示テキスト: ${ccResult.visibleText || '不明'}\nユーザーの意図: ${ccResult.userIntent || '不明'}\n推奨アクション: ${ccResult.suggestedAction || '不明'}\n${ccResult.matched ? '特定対象: ' + ccResult.matched : ''}`;
-            // CC判定結果のtargetFuncでコードコンテキスト取得
-            const ccTargetFunc = ccResult.targetFunc || '';
-            const ccSearchInput = ccTargetFunc ? `${userInput} ${ccTargetFunc}` : userInput;
-            _codeContext = await gatherCodeContext(ccSearchInput);
-            const provider = pickProvider(['claude', 'gpt', 'gemini']);
-            showTyping(provider);
-            const sp = buildMeetingSystemPrompt(session.minutes, userInput, provider, null);
-            const response = await callAI(provider, sp, `${ccReport}\n\nユーザー入力: ${userInput}\n\n【回答ルール — 絶対守れ】
-1. Claude Code判定結果は実ファイルを確認した事実。これを元に回答しろ
-2. ユーザーはド素人。行番号・関数名・変数名・ファイル名・技術用語は絶対に回答に出すな
-3. 修正が必要なら「直すわ」と言え。技術的な修正指示はdiagnosisブロックのinstructionに入れろ（instructionの中だけ技術用語OK）
-4. ${ccTargetFunc ? '内部参照: ' + ccTargetFunc + '（回答に出すな）' : ''}`, []);
-            hideTyping();
-            const diagnosis = extractDiagnosis(response);
-            appendMinutes(provider, '回答', stripDiagnosisBlock(response), '', threadId);
-            appendChatLog('ai', stripDiagnosisBlock(response), provider);
-            if (diagnosis && (diagnosis.taskType === 'code_fix' || diagnosis.taskType === 'orchestrate') && serverAlive) {
-              await executeCodeFix(diagnosis);
-            }
-            _chatBusy = false;
-            return;
-          } else {
-            appendChatLog('status', '📷 画像判定タイムアウト → 通常フローにフォールバック');
-          }
-        }
-      } catch(e) {
-        appendChatLog('status', `📷 CC特定失敗: ${e.message} → 通常フローにフォールバック`);
-      }
+      const handled = await handleImageInput(userInput, session, threadId);
+      if (handled) { _chatBusy = false; return; }
     }
   }
 
@@ -2443,6 +2316,84 @@ function _captureStyleSnapshot(instruction) {
   }
   return snapshot;
 }
+
+// ═══ 画像付き入力の共通処理（startNewMeeting/continueSession両方から呼ぶ） ═══
+// 画像判定と最終回答を分離: CC特定ルートで画像を判定→結果を使ってAIが回答
+async function handleImageInput(userInput, session, threadId) {
+  if (!chatImages || chatImages.length === 0 || !serverAlive) return false;
+
+  appendChatLog('status', '📷 スクショ付き → Claude Code（daemon）に画像判定を依頼中...');
+  try {
+    // STEP 1: CC特定ルートで画像判定（画像を見るAI = ClaudeCode）
+    const identifyRes = await fetchWithTimeout('http://localhost:5000/api/code/identify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userText: userInput, targetFile: 'os_for_human_pipeline_v3.html', images: chatImages })
+    }, 10000);
+    chatImages = []; renderChatAttachments();
+
+    if (!identifyRes.ok) return false;
+    const idData = await identifyRes.json();
+    appendChatLog('status', `📷 CC特定リクエスト送信: ${idData.requestId}`);
+
+    // STEP 2: ポーリングで判定結果を待つ（最大90秒）
+    let ccResult = null;
+    for (let wait = 0; wait < 90000; wait += 3000) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const rr = await fetchWithTimeout(`http://localhost:5000/api/code/identify/${idData.requestId}`, {}, 3000);
+        if (rr.ok) { ccResult = await rr.json(); if (ccResult.screenState || ccResult.suggestedAction) break; }
+      } catch(e) {}
+      if (wait % 15000 === 0 && wait > 0) appendChatLog('status', `📷 画像判定中... (${Math.round(wait/1000)}秒経過)`);
+    }
+
+    if (!ccResult || (!ccResult.screenState && !ccResult.suggestedAction)) {
+      appendChatLog('status', '📷 画像判定タイムアウト → 通常フローにフォールバック');
+      return false;
+    }
+
+    // STEP 3: 判定結果の確信度チェック（根拠不足なら確認を返す）
+    const confidence = ccResult.confidence || 'low';
+    const ccReport = `【Claude Codeの画像判定結果（実ファイルを確認した事実）】
+画面状態: ${ccResult.screenState || '不明'}
+表示テキスト: ${ccResult.visibleText || '不明'}
+ユーザーの意図: ${ccResult.userIntent || '不明'}
+推奨アクション: ${ccResult.suggestedAction || '不明'}
+確信度: ${confidence}
+${ccResult.matched ? '特定対象: ' + ccResult.matched : '対象未特定'}`;
+
+    // STEP 4: 根拠付きでAIに回答させる（最終回答するAI ≠ 画像を見るAI）
+    const ccTargetFunc = ccResult.targetFunc || '';
+    _codeContext = await gatherCodeContext(ccTargetFunc ? `${userInput} ${ccTargetFunc}` : userInput);
+    const provider = pickProvider(['claude', 'gpt', 'gemini']);
+    showTyping(provider);
+    const sp = buildMeetingSystemPrompt(session.minutes, userInput, provider, null);
+
+    // 確信度が低い場合は断定禁止ルールを強化
+    const confidenceRule = confidence === 'high'
+      ? '画像判定の確信度が高い。判定結果をそのまま使ってOK'
+      : '画像判定の確信度が低い。「○○に見えるけど合ってる？」と確認を返せ。断定するな';
+
+    const response = await callAI(provider, sp, `${ccReport}\n\nユーザー入力: ${userInput}\n\n【回答ルール — 絶対守れ】
+1. 上記のClaude Code判定結果は実ファイルを確認した事実。これを元に回答しろ
+2. ${confidenceRule}
+3. ユーザーはド素人。関数名・行番号・変数名等の技術用語は絶対に使うな
+4. 回答構造: ①何が起きてるか → ②なぜそうなったか → ③どうするか
+5. 修正が必要と判断したらdiagnosisブロックにinstructionを入れろ（中だけ技術用語OK）`, []);
+    hideTyping();
+
+    const diagnosis = extractDiagnosis(response);
+    appendMinutes(provider, '回答', stripDiagnosisBlock(response), '', threadId);
+    appendChatLog('ai', stripDiagnosisBlock(response), provider);
+    if (diagnosis && (diagnosis.taskType === 'code_fix' || diagnosis.taskType === 'orchestrate') && serverAlive) {
+      await executeCodeFix(diagnosis);
+    }
+    return true; // 処理完了
+  } catch(e) {
+    appendChatLog('status', `📷 CC特定失敗: ${e.message} → 通常フローにフォールバック`);
+    return false;
+  }
+}
+
 
 async function executeCodeFix(diagnosis) {
   // 重複防止
