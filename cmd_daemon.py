@@ -29,6 +29,30 @@ FAILED_QUEUE_DIR = BRIDGE_DIR / "failed_queue"
 SERVER_URL = "http://localhost:5000"
 # claude -p は使わない（Claude API + /api/file/edit 方式に移行済み）
 
+def _record_fix_history(result_data, instruction=""):
+    """修正結果をfix_historyテーブルに自動記録する（結果JSON書き込み時に呼ぶ）"""
+    try:
+        import urllib.request
+        payload = json.dumps({
+            "requestId": result_data.get("requestId", ""),
+            "issueType": "code_fix",
+            "issueSummary": result_data.get("audit", {}).get("reason", "")[:200],
+            "issueTarget": result_data.get("targetFile", ""),
+            "issueKeywords": "",
+            "fixMethod": result_data.get("engine", "daemon"),
+            "fixInstruction": instruction[:300],
+            "fixModel": "",
+            "resultSuccess": result_data.get("success", False),
+            "resultAuditPassed": result_data.get("audit", {}).get("passed", False),
+            "resultAuditReason": result_data.get("audit", {}).get("reason", "")[:200],
+            "resultFileChanged": result_data.get("file_changed", False),
+        }).encode("utf-8")
+        req = urllib.request.Request(f"{SERVER_URL}/api/fix-history/record",
+            data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass  # 記録失敗は無視（修正処理を止めない）
+
 CODE_REQ_DIR.mkdir(exist_ok=True)
 CODE_RESULT_DIR.mkdir(exist_ok=True)
 DONE_DIR.mkdir(exist_ok=True)
@@ -716,6 +740,50 @@ def _compress_for_budget(file_snippet, budget_tokens, lines, total, instruction)
     return ultra_compressed
 
 
+def _search_past_fixes(target, instruction):
+    """過去の修正履歴から同様の案件を検索し、失敗パターンと成功パターンを返す"""
+    import re as _re
+    try:
+        import requests as _req
+        # キーワード抽出
+        keywords = _re.findall(r'[a-zA-Z_]\w{3,}', instruction)
+        jp_kw = _re.findall(r'[\u3040-\u9fff]{2,}', instruction)
+        search_kw = ' '.join(list(dict.fromkeys(keywords + jp_kw))[:8])
+        if not search_kw:
+            return ""
+
+        # 過去の失敗を検索
+        fail_res = _req.post('http://localhost:5000/api/fix-history/search',
+            json={"keywords": search_kw, "target": target, "onlyFailed": True, "limit": 3}, timeout=3)
+        # 過去の成功を検索
+        ok_res = _req.post('http://localhost:5000/api/fix-history/search',
+            json={"keywords": search_kw, "target": target, "onlySuccess": True, "limit": 3}, timeout=3)
+
+        past_context = ""
+        if fail_res.ok:
+            fails = fail_res.json().get("results", [])
+            if fails:
+                past_context += "\n【過去の失敗事例 — 同じ失敗を繰り返すな】\n"
+                for f in fails:
+                    past_context += f"  ❌ {f['requestId']}: {f['auditReason'][:80]}\n"
+                past_context += "上記のパターンで失敗してる。同じやり方は避けろ。\n"
+
+        if ok_res.ok:
+            oks = ok_res.json().get("results", [])
+            if oks:
+                past_context += "\n【過去の成功事例 — このやり方なら通る】\n"
+                for o in oks:
+                    past_context += f"  ✅ {o['requestId']}: {o['auditReason'][:80]}\n"
+                past_context += "上記のパターンで成功してる。参考にしろ。\n"
+
+        if past_context:
+            print(f"[daemon] 過去の修正履歴を注入: 失敗{len(fails if fail_res.ok else [])}件 / 成功{len(oks if ok_res.ok else [])}件")
+        return past_context
+    except Exception as e:
+        print(f"[daemon] 過去履歴検索エラー（無視して続行）: {e}")
+        return ""
+
+
 def generate_edit(target, instruction, file_content, images=None):
     """Claude APIでold_string/new_stringの編集指示を生成する"""
     # AI提案コードが含まれていたら、Claude APIを使わず直接edit生成
@@ -843,6 +911,9 @@ def generate_edit(target, instruction, file_content, images=None):
 - import文が必要なら既存のimportブロックに追加すること
 """
 
+    # 過去の修正履歴を検索して注入
+    past_fixes = _search_past_fixes(target, instruction)
+
     prompt = f"""あなたはコード修正エンジンです。
 
 【対象ファイル】{target}（全{total}行）
@@ -852,6 +923,7 @@ def generate_edit(target, instruction, file_content, images=None):
 {image_instruction}
 【修正依頼】
 {instruction}
+{past_fixes}
 
 【絶対ルール — 違反すると失敗する】
 1. old_stringはファイル内に**実在する文字列をそのままコピー**すること。⚠️行番号プレフィックス（例: "123: "）は絶対にold_stringに含めるな⚠️ 行番号はファイルの一部ではない。1文字でも違うと失敗する。空白・インデントも正確に一致させろ
@@ -1410,6 +1482,7 @@ def execute_request(req, error_feedback=""):
         }
         result_file = CODE_RESULT_DIR / f"{req_id}_result.json"
         result_file.write_text(json.dumps(result_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _record_fix_history(result_data, instruction)
 
         # 処理済みに移動
         try:
