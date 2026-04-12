@@ -1,0 +1,11 @@
+.env
+backups/
+code_requests/
+code_results/
+logs/
+__pycache__/
+*.pyc
+node_modules/
+mcp_server/
+CODE_INPUT.txt
+CODE_OUTPUT.txt
