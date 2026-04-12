@@ -2507,6 +2507,31 @@ async function executeCodeFix(diagnosis) {
     setPipelineStep('pipe-codefix', 'error');
     appendMinutes('system', '修正失敗', `❌ 送信できんかった: ${error.message}`);
   }
+
+  // ★ 修正履歴を自動記録（壊れた→直した→結果の対応関係）
+  try {
+    const wasSuccess = result && result.success;
+    fetchWithTimeout('http://localhost:5000/api/fix-history/record', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        requestId: jobId || '',
+        issueType: diagnosis.taskType || 'code_fix',
+        issueSummary: (diagnosis.phenomenon || diagnosis.threadName || threadLabel || '').slice(0, 200),
+        issueTarget: diagnosis.targetFile || diagnosis.targetFunc || 'v3.html',
+        issueKeywords: `${diagnosis.threadName || ''} ${diagnosis.targetFunc || ''} ${threadLabel}`.trim(),
+        fixMethod: 'managed-execute',
+        fixInstruction: (instruction || '').slice(0, 300),
+        fixModel: diagnosis.model || 'sonnet',
+        resultSuccess: wasSuccess,
+        resultAuditPassed: wasSuccess,
+        resultAuditReason: wasSuccess ? '成功' : (result?.failureSummary || '不明'),
+        resultFileChanged: wasSuccess,
+        retryCount: result?.retries || 0,
+        sessionId: currentSessionId || '',
+      })
+    }, 5000).catch(() => {});
+  } catch(e) {}
+
   hideTyping();
 }
 

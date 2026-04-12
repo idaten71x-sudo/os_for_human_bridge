@@ -2414,7 +2414,7 @@ def vault_test_keys():
 SESSIONS_DB = BRIDGE_DIR / "sessions.db"
 
 def _init_sessions_db():
-    """v3セッションテーブルを初期化"""
+    """v3セッションテーブル + 修正履歴テーブルを初期化"""
     conn = sqlite3.connect(str(SESSIONS_DB))
     conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,
@@ -2429,12 +2429,201 @@ def _init_sessions_db():
         diagnosis TEXT,
         chat_log TEXT
     )""")
+    # ─── 修正履歴テーブル: 壊れた→直した→結果の対応関係を構造化 ───
+    conn.execute("""CREATE TABLE IF NOT EXISTS fix_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT,
+        created_at TEXT,
+        -- 何が壊れたか
+        issue_type TEXT,
+        issue_summary TEXT,
+        issue_target TEXT,
+        issue_keywords TEXT,
+        -- どう直したか
+        fix_method TEXT,
+        fix_instruction TEXT,
+        fix_model TEXT,
+        -- 結果
+        result_success INTEGER,
+        result_audit_passed INTEGER,
+        result_audit_reason TEXT,
+        result_file_changed INTEGER,
+        -- 検証
+        verify_method TEXT,
+        verify_result TEXT,
+        -- メタ
+        retry_count INTEGER DEFAULT 0,
+        related_fix_id INTEGER,
+        session_id TEXT
+    )""")
+    # 検索用インデックス
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fix_keywords ON fix_history(issue_keywords)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fix_target ON fix_history(issue_target)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fix_type ON fix_history(issue_type)")
     conn.commit()
     conn.close()
-    print("  [v3] セッションDB初期化完了:", SESSIONS_DB)
+    print("  [v3] セッションDB + 修正履歴テーブル初期化完了:", SESSIONS_DB)
 
 def _get_sessions_db():
     return sqlite3.connect(str(SESSIONS_DB))
+
+# ═══════════════════════════════════════
+# 修正履歴API（壊れた→直した→結果の構造化記録）
+# ═══════════════════════════════════════
+
+@app.route("/api/fix-history/record", methods=["POST"])
+def record_fix():
+    """修正の結果を履歴テーブルに記録する"""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        conn = _get_sessions_db()
+        conn.execute("""INSERT INTO fix_history
+            (request_id, created_at, issue_type, issue_summary, issue_target, issue_keywords,
+             fix_method, fix_instruction, fix_model, result_success, result_audit_passed,
+             result_audit_reason, result_file_changed, verify_method, verify_result,
+             retry_count, related_fix_id, session_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+            sanitize(data.get("requestId", "")),
+            datetime.datetime.now().isoformat(),
+            sanitize(data.get("issueType", "")),
+            sanitize(data.get("issueSummary", ""))[:500],
+            sanitize(data.get("issueTarget", "")),
+            sanitize(data.get("issueKeywords", "")),
+            sanitize(data.get("fixMethod", "daemon")),
+            sanitize(data.get("fixInstruction", ""))[:500],
+            sanitize(data.get("fixModel", "sonnet")),
+            1 if data.get("resultSuccess") else 0,
+            1 if data.get("resultAuditPassed") else 0,
+            sanitize(data.get("resultAuditReason", ""))[:300],
+            1 if data.get("resultFileChanged") else 0,
+            sanitize(data.get("verifyMethod", "")),
+            sanitize(data.get("verifyResult", "")),
+            int(data.get("retryCount", 0)),
+            data.get("relatedFixId"),
+            sanitize(data.get("sessionId", "")),
+        ))
+        conn.commit()
+        fix_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        return jsonify({"status": "recorded", "fixId": fix_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/fix-history/search", methods=["POST"])
+def search_fix_history():
+    """過去の修正履歴を検索する（同じ問題で前にどう直したか引く用）"""
+    data = request.get_json(force=True, silent=True) or {}
+    keywords = sanitize(data.get("keywords", ""))
+    target = sanitize(data.get("target", ""))
+    issue_type = sanitize(data.get("issueType", ""))
+    only_success = data.get("onlySuccess", False)
+    only_failed = data.get("onlyFailed", False)
+    limit = min(int(data.get("limit", 10)), 50)
+
+    try:
+        conn = _get_sessions_db()
+        conn.row_factory = sqlite3.Row
+
+        conditions = []
+        params = []
+
+        if keywords:
+            # キーワードでissue_summary, issue_keywords, fix_instructionをLIKE検索
+            kw_conds = []
+            for kw in keywords.split():
+                kw = kw.strip()
+                if kw:
+                    kw_conds.append("(issue_summary LIKE ? OR issue_keywords LIKE ? OR fix_instruction LIKE ?)")
+                    params.extend([f"%{kw}%", f"%{kw}%", f"%{kw}%"])
+            if kw_conds:
+                conditions.append("(" + " AND ".join(kw_conds) + ")")
+
+        if target:
+            conditions.append("issue_target LIKE ?")
+            params.append(f"%{target}%")
+
+        if issue_type:
+            conditions.append("issue_type = ?")
+            params.append(issue_type)
+
+        if only_success:
+            conditions.append("result_success = 1 AND result_audit_passed = 1")
+        elif only_failed:
+            conditions.append("(result_success = 0 OR result_audit_passed = 0)")
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(limit)
+
+        rows = conn.execute(f"""
+            SELECT * FROM fix_history
+            {where}
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, params).fetchall()
+
+        conn.close()
+
+        results = []
+        for r in rows:
+            results.append({
+                "id": r["id"],
+                "requestId": r["request_id"],
+                "createdAt": r["created_at"],
+                "issueType": r["issue_type"],
+                "issueSummary": r["issue_summary"],
+                "issueTarget": r["issue_target"],
+                "fixMethod": r["fix_method"],
+                "fixInstruction": r["fix_instruction"][:200] if r["fix_instruction"] else "",
+                "fixModel": r["fix_model"],
+                "success": bool(r["result_success"]),
+                "auditPassed": bool(r["result_audit_passed"]),
+                "auditReason": r["result_audit_reason"],
+                "verifyResult": r["verify_result"],
+                "retryCount": r["retry_count"],
+            })
+
+        return jsonify({
+            "results": results,
+            "total": len(results),
+            "query": {"keywords": keywords, "target": target, "issueType": issue_type},
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "results": []}), 500
+
+
+@app.route("/api/fix-history/stats", methods=["GET"])
+def fix_history_stats():
+    """修正履歴の統計（よく壊れるパターン、成功率の高い修正方法）"""
+    try:
+        conn = _get_sessions_db()
+        conn.row_factory = sqlite3.Row
+        total = conn.execute("SELECT count(*) FROM fix_history").fetchone()[0]
+        success = conn.execute("SELECT count(*) FROM fix_history WHERE result_success = 1 AND result_audit_passed = 1").fetchone()[0]
+        # よく壊れるターゲット
+        top_targets = conn.execute("""
+            SELECT issue_target, count(*) as cnt,
+                   SUM(CASE WHEN result_success=1 AND result_audit_passed=1 THEN 1 ELSE 0 END) as ok
+            FROM fix_history
+            GROUP BY issue_target ORDER BY cnt DESC LIMIT 5
+        """).fetchall()
+        # よく壊れるタイプ
+        top_types = conn.execute("""
+            SELECT issue_type, count(*) as cnt,
+                   SUM(CASE WHEN result_success=1 AND result_audit_passed=1 THEN 1 ELSE 0 END) as ok
+            FROM fix_history
+            GROUP BY issue_type ORDER BY cnt DESC LIMIT 5
+        """).fetchall()
+        conn.close()
+        return jsonify({
+            "total": total, "success": success,
+            "successRate": round(success / total * 100, 1) if total > 0 else 0,
+            "topTargets": [{"target": r["issue_target"], "count": r["cnt"], "successCount": r["ok"]} for r in top_targets],
+            "topTypes": [{"type": r["issue_type"], "count": r["cnt"], "successCount": r["ok"]} for r in top_types],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/sessions", methods=["GET"])
 def list_sessions():
