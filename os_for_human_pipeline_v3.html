@@ -1111,11 +1111,52 @@ function detectFrustration(text) {
 
 // ─── 口語化プロンプト ───
 // ─── 事実収集: AIに回答させる前にv3の実コードを取得 ───
-async function gatherCodeContext(userInput) {
+async function gatherCodeContext(userInput, contextType = 'general') {
   if (!serverAlive) return '';
   let context = '';
+  let _evidenceQuality = 'none';
+
+  // ═══ STEP 1: ログ資産から根拠を検索（検索→抽出→根拠付き） ═══
   try {
-    // server側の要約APIを並列呼び出し（生データはHTMLに持たない）
+    const evidenceRes = await fetchWithTimeout('http://localhost:5000/api/evidence/search', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ userInput, contextType, limit: 8 })
+    }, 5000);
+    if (evidenceRes.ok) {
+      const ev = await evidenceRes.json();
+      _evidenceQuality = ev.evidenceQuality || 'none';
+
+      // 根拠品質を表示（AIに根拠の強さを伝える）
+      context += `\n【ログ根拠の品質】${ev.evidenceMessage || '不明'}\n`;
+      context += `検索キーワード: ${(ev.keywords || []).join(', ')}\n`;
+
+      // 過去ログの根拠（各エントリにIDを付与）
+      if (ev.evidence && ev.evidence.length > 0) {
+        context += `\n【過去ログ根拠（${ev.evidence.length}件）— 回答で「どのログを見たか」を明示しろ】\n`;
+        ev.evidence.forEach((e, i) => {
+          context += `[根拠${i+1}] ソース:${e.source} 関連度:${e.relevance} 日時:${e.created_at || '不明'}\n`;
+          context += `  内容: ${e.snippet}\n`;
+        });
+      }
+
+      // daemon修正結果の根拠
+      if (ev.fixEvidence && ev.fixEvidence.length > 0) {
+        context += `\n【修正履歴根拠（${ev.fixEvidence.length}件）】\n`;
+        ev.fixEvidence.forEach((f, i) => {
+          context += `[修正${i+1}] ${f.success ? '✅' : '❌'} ${f.requestId} → ${f.target} (${f.completedAt})\n`;
+          if (f.reason) context += `  理由: ${f.reason}\n`;
+        });
+      }
+
+      // 根拠が弱い/ない場合のルール
+      if (_evidenceQuality === 'weak' || _evidenceQuality === 'none') {
+        context += `\n⚠️【根拠不足】関連ログが十分に見つかっていない。推測で回答するな。「ログ上ではここまでしか確認できてない」と正直に言え。\n`;
+      }
+    }
+  } catch(e) {}
+
+  // ═══ STEP 2: 要約APIで現在の状態を補完 ═══
+  try {
     const [progressRes, codeRes] = await Promise.all([
       fetchWithTimeout('http://localhost:5000/api/summary/progress', {
         method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}'
@@ -1127,18 +1168,20 @@ async function gatherCodeContext(userInput) {
     ]);
     if (progressRes.ok) {
       const p = await progressRes.json();
-      context += `\n【daemon進捗】成功率${p.success_rate} / キュー: pending${p.queue.pending}件, running${p.queue.running}件\n`;
+      context += `\n【現在のdaemon状態】成功率${p.success_rate} / キュー: pending${p.queue.pending}件\n`;
       if (p.recent && p.recent.length > 0) context += `直近: ${p.recent.map(r => `${r.success?'✅':'❌'}${r.summary||r.file||'?'}`).join(', ')}\n`;
-      if (p.error_trend) context += `エラー傾向: ${p.error_trend}\n`;
     }
     if (codeRes.ok) {
       const c = await codeRes.json();
-      context += `\n【関連コード要約】${c.summary}\n`;
-      if (c.relatedFunctions && c.relatedFunctions.length > 0) context += `関連関数: ${c.relatedFunctions.join(', ')}\n`;
-      if (c.relatedLines) context += `関連行: ${c.relatedLines}\n`;
+      if (c.relatedFunctions && c.relatedFunctions.length > 0) context += `\n【関連コード】${c.summary}\n`;
     }
-    context += `\n【重要】上記の要約に基づいて回答しろ。修正が必要な場合は、具体的な修正コードをコードブロックで書け。\n`;
   } catch(e) {}
+
+  // ═══ STEP 3: 回答ルール ═══
+  context += `\n【回答ルール — 絶対守れ】\n`;
+  context += `1. 回答には必ず「どのログ/どの修正結果を根拠にしたか」を明示しろ（例:「[根拠1]のログによると〜」）\n`;
+  context += `2. 根拠が弱い場合は「ログ上ではここまでしか確認できてない」と正直に言え。推測は推測と明示しろ\n`;
+  context += `3. 修正が必要な場合は具体的な修正コードをコードブロックで書け\n`;
 
   // server.py/cmd_daemon.py関連の話題 → 失敗分析APIで補完
   const needsBackend = /server|daemon|API|エラー|404|429|疎通|モデル|model|gemini|claude|gpt|grok|設定|ヘルスチェック|health/i.test(userInput);
@@ -1150,7 +1193,7 @@ async function gatherCodeContext(userInput) {
       if (failRes.ok) {
         const f = await failRes.json();
         if (f.analysis && f.analysis !== '直近の失敗なし') {
-          context += `\n【直近の失敗分析】タイプ: ${f.failureType} / ${f.analysis}\n提案: ${f.suggestion}\n`;
+          context += `\n【直近の失敗分析】タイプ: ${f.failureType} / ${f.analysis}\n`;
         }
       }
     } catch(e) {}
@@ -1308,10 +1351,11 @@ ${BUSINESS_CONTEXT}
   ユーザー: 「Geminiのエラー直して」
   → 対象が明確 → 確認不要。即調査でOK
 
-【確認した後の回答の構造 — 3点を含めろ】
+【確認した後の回答の構造 — 4点を含めろ】
 1. 「何が起きてるか」を素人にわかる1〜2行で
 2. 「なぜそうなったか」の原因を素人語で。原因不明なら「調べたけど原因まだわからん」と正直に言え
-3. 「こっちでやること」を具体的に（「修正するわ」「調べてみる」「やり直すで」等）。ユーザーに作業させるな
+3. 「根拠」— どのログ/修正結果を見てそう判断したか明示しろ（例:「[根拠1]のログを見ると〜」「直近の修正[修正2]で〜」）。根拠がない場合は「ログ上ではここまでしか確認できてない」と正直に言え。推測は「推測やけど」と明示しろ
+4. 「こっちでやること」を具体的に（「修正するわ」「調べてみる」「やり直すで」等）。ユーザーに作業させるな
 
 ⚠️ 絶対禁止（1つでも出したら不合格）:
 - 行番号（882付近、行1234、L100-200 等）

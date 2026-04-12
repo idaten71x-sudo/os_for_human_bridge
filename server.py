@@ -637,6 +637,160 @@ def search_past_logs():
         return jsonify({"error": str(e), "results": [], "total": 0}), 500
 
 
+# ─── 根拠付きログ検索API（検索→抽出→根拠付き要約）───
+
+@app.route("/api/evidence/search", methods=["POST"])
+def evidence_search():
+    """案件に関連するログを検索し、根拠付きで返す。
+    要約APIの前段として使う: まず候補ログを検索→関連度で抽出→根拠IDと共に返す。
+    """
+    if not _fts_ready.is_set():
+        return jsonify({"evidence": [], "evidenceQuality": "unavailable", "message": "ログインデックス構築中"})
+
+    data = request.get_json(force=True, silent=True) or {}
+    user_input = sanitize(data.get("userInput", ""))
+    context_type = data.get("contextType", "general")  # progress/failure/code_fix/general
+    limit = min(int(data.get("limit", 8)), 20)
+
+    if not user_input:
+        return jsonify({"evidence": [], "evidenceQuality": "no_input"})
+
+    import re as _re
+
+    # STEP 1: キーワード抽出（日本語+英語）
+    en_keywords = _re.findall(r'[a-zA-Z_][a-zA-Z0-9_]{2,}', user_input)
+    jp_keywords = _re.findall(r'[\u3040-\u9fff]{2,}', user_input)
+    all_keywords = list(dict.fromkeys(en_keywords + jp_keywords))[:10]
+
+    # context_typeに応じた追加キーワード
+    if context_type == "progress":
+        all_keywords += ["成功", "失敗", "完了", "修正", "daemon"]
+    elif context_type == "failure":
+        all_keywords += ["エラー", "失敗", "原因", "429", "タイムアウト"]
+    elif context_type == "code_fix":
+        all_keywords += ["修正", "code_fix", "daemon", "old_string"]
+
+    # STEP 2: FTS5検索（OR検索で広めに取る）
+    evidence = []
+    try:
+        conn = sqlite3.connect(str(_FTS_DB))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+
+        # キーワードをOR結合でFTS5検索
+        if all_keywords:
+            fts_query = " OR ".join(f'"{k}"' for k in all_keywords[:8])
+        else:
+            fts_query = f'"{user_input[:50]}"'
+
+        # logsテーブル検索（hq優先→v3_session→一般会話の順）
+        source_priority = {"hq": 0, "v3_session": 1, "v2_diagnosis": 2}
+        all_rows = []
+
+        for table, source_col in [("logs", True), ("hq_logs", False)]:
+            try:
+                if source_col:
+                    c.execute(f"""
+                        SELECT source, topic, role,
+                               snippet({table}, 3, '>>>','<<<', '...', 80) as snippet,
+                               created_at, rank
+                        FROM {table}
+                        WHERE {table} MATCH ?
+                        ORDER BY rank
+                        LIMIT ?
+                    """, (fts_query, limit * 3))
+                else:
+                    c.execute(f"""
+                        SELECT 'hq' as source, '' as topic, '' as role,
+                               snippet({table}, 2, '>>>','<<<', '...', 80) as snippet,
+                               '' as created_at, rank
+                        FROM {table}
+                        WHERE {table} MATCH ?
+                        ORDER BY rank
+                        LIMIT ?
+                    """, (fts_query, limit * 2))
+                all_rows.extend(c.fetchall())
+            except Exception:
+                pass
+
+        conn.close()
+
+        # STEP 3: 関連度でソート（hq優先、キーワード一致数で重み付け）
+        scored = []
+        for r in all_rows:
+            source = r["source"] if "source" in r.keys() else "unknown"
+            snippet = r["snippet"] if "snippet" in r.keys() else ""
+            # スコア計算: ソース優先度 + キーワード一致数
+            priority = source_priority.get(source, 5)
+            kw_hits = sum(1 for k in all_keywords if k.lower() in snippet.lower())
+            score = kw_hits * 10 - priority
+            scored.append((score, {
+                "source": source,
+                "topic": r["topic"] if "topic" in r.keys() else "",
+                "snippet": snippet[:200],
+                "created_at": r["created_at"] if "created_at" in r.keys() else "",
+                "relevance": "high" if kw_hits >= 3 else "medium" if kw_hits >= 1 else "low",
+            }))
+
+        # 上位N件を抽出
+        scored.sort(key=lambda x: -x[0])
+        evidence = [s[1] for s in scored[:limit]]
+
+        # ノイズ除去: 一般会話ログでキーワード一致が弱いものは除外
+        evidence = [e for e in evidence if e["relevance"] != "low" or e["source"] == "hq"]
+
+    except Exception as e:
+        return jsonify({"evidence": [], "evidenceQuality": "error", "message": str(e)})
+
+    # STEP 4: 根拠品質の判定
+    high_count = sum(1 for e in evidence if e["relevance"] == "high")
+    if high_count >= 3:
+        quality = "strong"
+        quality_msg = f"強い根拠あり（高関連{high_count}件）"
+    elif high_count >= 1 or len(evidence) >= 3:
+        quality = "moderate"
+        quality_msg = f"中程度の根拠（高関連{high_count}件、全{len(evidence)}件）"
+    elif len(evidence) > 0:
+        quality = "weak"
+        quality_msg = f"根拠が弱い（低関連のみ{len(evidence)}件）。推測回答になる可能性あり"
+    else:
+        quality = "none"
+        quality_msg = "関連ログなし。根拠なしの回答になる"
+
+    # code_results（daemon修正結果）も検索
+    fix_evidence = []
+    try:
+        results_dir = BRIDGE_DIR / "code_results"
+        result_files = sorted(results_dir.glob("*_result.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for rf in result_files[:10]:
+            try:
+                rd = json.loads(rf.read_text(encoding="utf-8"))
+                target = rd.get("targetFile", "")
+                audit_reason = rd.get("audit", {}).get("reason", "")
+                summary_text = f"{target} {audit_reason}"
+                if any(k.lower() in summary_text.lower() for k in all_keywords[:5]):
+                    fix_evidence.append({
+                        "requestId": rd.get("requestId", rf.stem),
+                        "success": rd.get("success", False),
+                        "target": target,
+                        "reason": audit_reason[:100],
+                        "completedAt": rd.get("completedAt", ""),
+                    })
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return jsonify({
+        "evidence": evidence[:limit],
+        "fixEvidence": fix_evidence[:5],
+        "evidenceQuality": quality,
+        "evidenceMessage": quality_msg,
+        "keywords": all_keywords[:8],
+        "total": len(evidence),
+    })
+
+
 # ─── FTS5追記API（v2 HTML/daemon/セッションログから随時追記）───
 
 @app.route("/api/logs/append", methods=["POST"])
