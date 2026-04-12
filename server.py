@@ -2051,6 +2051,113 @@ def code_stats():
 
 
 # ═══════════════════════════════════════
+# ═══════════════════════════════════════
+# UI構造自動解析API（ClaudeCodeの判断基準をHTMLのAIに共有する）
+# ═══════════════════════════════════════
+
+_ui_map_cache = {"mtime": 0, "data": None}
+
+@app.route("/api/ui-map", methods=["GET"])
+def get_ui_map():
+    """v3.htmlのDOM構造を自動解析し、UIパーツマップを返す。
+    コード変更に連動（mtimeチェックでキャッシュ）。
+    HTMLのAIがスクショを見た時に「これは何か」を正確に判断するための材料。"""
+    target = Path(DEFAULT_TARGET_FILE)
+    if not target.exists():
+        return jsonify({"error": "target not found"}), 404
+
+    # mtimeチェック: ファイルが変わってなければキャッシュを返す
+    current_mtime = target.stat().st_mtime
+    if _ui_map_cache["mtime"] == current_mtime and _ui_map_cache["data"]:
+        return jsonify(_ui_map_cache["data"])
+
+    import re as _re
+    content = target.read_text(encoding="utf-8")
+    lines = content.split("\n")
+
+    # HTMLセクション（<script>の前）を抽出
+    script_start = content.find("<script>")
+    html_section = content[:script_start] if script_start > 0 else content[:500]
+
+    # UI要素の自動抽出
+    elements = []
+
+    # id付き要素
+    for m in _re.finditer(r'id="([^"]+)"', html_section):
+        eid = m.group(1)
+        # 周辺のテキストからラベルを推測
+        pos = m.start()
+        context_start = max(0, pos - 100)
+        context = html_section[context_start:pos + 100]
+        # class, placeholder, textContent等を抽出
+        cls = ""
+        cls_m = _re.search(r'class="([^"]*)"', context)
+        if cls_m:
+            cls = cls_m.group(1)
+        placeholder = ""
+        ph_m = _re.search(r'placeholder="([^"]*)"', context)
+        if ph_m:
+            placeholder = ph_m.group(1)[:50]
+        elements.append({"id": eid, "class": cls[:60], "placeholder": placeholder})
+
+    # ボタン要素
+    buttons = []
+    for m in _re.finditer(r'<button[^>]*>(.*?)</button>', html_section, _re.DOTALL):
+        text = _re.sub(r'<[^>]+>', '', m.group(1)).strip()[:30]
+        onclick = ""
+        onclick_m = _re.search(r'onclick="([^"]*)"', m.group(0))
+        if onclick_m:
+            onclick = onclick_m.group(1)[:40]
+        if text:
+            buttons.append({"text": text, "onclick": onclick})
+
+    # CSSカスタムプロパティ（色定義）
+    colors = {}
+    for m in _re.finditer(r'--([\w-]+)\s*:\s*([^;]+);', html_section):
+        colors[m.group(1)] = m.group(2).strip()
+
+    # レイアウト構造（主要divのclass）
+    layout = []
+    for m in _re.finditer(r'<div\s+class="([^"]*(?:header|sidebar|main|conference|chat|pipeline)[^"]*)"', html_section):
+        layout.append(m.group(1))
+
+    # ステータスインジケータ
+    indicators = []
+    for m in _re.finditer(r'id="(status[^"]*|indicator[^"]*|dot[^"]*)"', html_section, _re.IGNORECASE):
+        indicators.append(m.group(1))
+    # server/daemon/launcher ドット
+    for m in _re.finditer(r'title="([^"]*(?:server|daemon|launcher)[^"]*)"', html_section, _re.IGNORECASE):
+        indicators.append(m.group(1))
+
+    # JS関数一覧（主要なものだけ）
+    js_section = content[script_start:] if script_start > 0 else ""
+    functions = _re.findall(r'(?:async\s+)?function\s+(\w+)', js_section)
+
+    # 結果構築
+    ui_map = {
+        "fileLines": len(lines),
+        "elements": elements[:30],
+        "buttons": buttons[:15],
+        "layout": layout[:10],
+        "indicators": indicators[:10],
+        "colors": dict(list(colors.items())[:15]),
+        "functionCount": len(functions),
+        "keyFunctions": [f for f in functions if f in [
+            "handleMainInput", "triageInput", "continueSession", "startNewMeeting",
+            "executeCodeFix", "appendMinutes", "appendChatLog", "callAI",
+            "gatherCodeContext", "buildMeetingSystemPrompt", "recommendExecutionMode",
+            "renderSessionList", "checkFileChange", "checkDaemonStatus",
+        ]],
+        "environment": "Windows 11, Chrome, localhost:5000",
+        "headerDescription": "左上:タイトル / 右上:緑緑赤の丸=server/daemon/launcher生存ドット(Macのボタンではない), API代概算, API設定ボタン",
+        "threeColumns": "左=ラベルツリー(セッション一覧) / 中央=AI議事録+入力欄 / 右=議題+パイプライン+chat履歴",
+    }
+
+    _ui_map_cache["mtime"] = current_mtime
+    _ui_map_cache["data"] = ui_map
+    return jsonify(ui_map)
+
+
 # 要約API（v3 GPT判定対応 — HTMLに生データを渡さない）
 # ═══════════════════════════════════════
 

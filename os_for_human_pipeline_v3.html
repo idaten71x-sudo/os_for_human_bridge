@@ -1329,9 +1329,12 @@ function buildMeetingSystemPrompt(minutes, userInput, speaker, logContext) {
     `#${m.turn} ${m.speaker}(${m.role}): ${m.content.slice(0, 200)}`
   ).join('\n');
 
+  const uiContext = window._dynamicUIContext || '';
+
   return `あなたは「${speaker.toUpperCase()}」として、AI会議に参加しています。
 
 === 以下はシステム事実。会話履歴より優先する ===
+${uiContext}
 
 ${SELF_CONTEXT}
 
@@ -1618,11 +1621,9 @@ async function startNewMeeting(userInput) {
   appendMinutes('user', '質問', userInput);
   appendChatLog('user', userInput);
 
-  // ═══ 画像付き → CC特定ルートに直行（APIのAIは画像判定できない。daemon経由でClaude Codeに判定させる） ═══
-  const _isQuestionNew = /なんで|なぜ|どうして|何で|どうなってる|どういう|教えて|見て|確認して|\?|？/.test(userInput);
-  const isFixRequest = !_isQuestionNew && /修正|直せ|直して|変えて|変更|おかしい|エラー|バグ|動かない|動かん|うごかん|消える|表示されない|反応ない|反応せん|壊れ|効かない|効かん|押しても|押せない|開かない|開かん|閉じない|閉じん|止まっ|固まっ|ここ|これ/.test(userInput);
-  if (chatImages.length > 0 && serverAlive && isFixRequest) {
-    appendChatLog('status', '📷 スクショ付き修正依頼 → Claude Code（daemon）に画像判定を依頼中...');
+  // ═══ 画像付き → 全部CC特定ルートに直行（APIのAIは画像判定できない。修正/質問問わずdaemon経由でClaude Codeに判定させる） ═══
+  if (chatImages.length > 0 && serverAlive) {
+    appendChatLog('status', '📷 スクショ付き → Claude Code（daemon）に画像判定を依頼中...');
     setPipelineStep('search', 'done');
     setPipelineStep('facts', 'done');
     try {
@@ -2095,10 +2096,9 @@ async function continueSession(userInput) {
       }
     } catch(e) {}
 
-    // ═══ 画像付き＋修正/質問系 → CC特定ルートに送信（continueSessionでも画像判断する） ═══
-    const isImgFixRequest = /修正|直せ|直して|変えて|変更|おかしい|エラー|バグ|動かない|動かん|うごかん|消える|表示されない|反応ない|反応せん|壊れ|効かない|効かん|押しても|押せない|開かない|開かん|閉じない|閉じん|止まっ|固まっ|これ|ここ|なんで|なにこれ/.test(userInput);
-    if (isImgFixRequest && chatImages.length > 0) {
-      appendMinutes('user', '修正依頼', userInput, '', threadId);
+    // ═══ 画像付き → 全部CC特定ルートに送信（修正/質問問わず。APIのAIは画像判定が弱い） ═══
+    if (chatImages.length > 0) {
+      appendMinutes('user', '画像付き質問', userInput, '', threadId);
       appendChatLog('user', userInput);
       appendChatLog('status', '📷 スクショ付き → daemon画像判定に依頼中...');
       try {
@@ -3468,6 +3468,32 @@ checkLauncherStatus();
 updateUsageDisplay();
 setTimeout(checkFirstTimeUser, 2000);
 console.log('[OS_FOR_HUMAN v3] 起動完了 — AI会議室 / 3カラム / 議事録エンジン / 自動リロード / 自動再起動');
+
+// ═══ 起動時: UIマップをserverから取得してSELF_CONTEXTに自動注入 ═══
+(async () => {
+  try {
+    const res = await fetchWithTimeout('http://localhost:5000/api/ui-map', {}, 5000);
+    if (res.ok) {
+      const uiMap = await res.json();
+      // SELF_CONTEXTに動的UIマップを追記（手書きUIマップより正確）
+      const dynamicContext = [
+        '',
+        '■ 【自動生成UIマップ — コード変更に連動して更新される】',
+        `  環境: ${uiMap.environment}`,
+        `  ヘッダー: ${uiMap.headerDescription}`,
+        `  3カラム: ${uiMap.threeColumns}`,
+        `  ボタン: ${(uiMap.buttons || []).map(b => b.text).join(', ')}`,
+        `  主要ID: ${(uiMap.elements || []).slice(0, 10).map(e => e.id).join(', ')}`,
+        `  主要関数(${uiMap.functionCount}個): ${(uiMap.keyFunctions || []).join(', ')}`,
+        `  インジケータ: ${(uiMap.indicators || []).join(', ')}`,
+      ].join('\n');
+      // SELF_CONTEXTはconstで宣言されてるが文字列なので上書きはできない。
+      // buildMeetingSystemPromptで使う時に動的に追加する
+      window._dynamicUIContext = dynamicContext;
+      console.log('[UI-MAP] 自動生成UIマップをロード完了');
+    }
+  } catch(e) {}
+})();
 
 // DOMロード完了後にセッション復元 + ログ同期 + pending code_fix結果チェック
 window.addEventListener('load', () => {
