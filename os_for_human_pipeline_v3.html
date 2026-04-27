@@ -1890,6 +1890,11 @@ ${provider.toUpperCase()}の回答（抜粋）: ${firstResponseShort}
       if (pastFix) {
         appendChatLog('status', `同じ修正の成功記録あり (${pastFix.requestId})。参照して再依頼。`);
       }
+      const requestId = generateRequestId();
+      const recipeKey = computeRecipeKey(userInput, finalDiagnosis.targetFunc || 'v3.html', '');
+      finalDiagnosis.requestId = requestId;
+      finalDiagnosis.recipeKey = recipeKey;
+      finalDiagnosis.caller = 'startNewMeeting';
       await executeCodeFix(finalDiagnosis);
     }
     saveDiagnosisLog(userInput, firstResponse || '', finalDiagnosis, provider);
@@ -2066,6 +2071,11 @@ ${lastFewMinutes}
 
       // 介入AIがcode_fixを出したら即実行
       if (diagnosis && (diagnosis.taskType === 'code_fix' || diagnosis.taskType === 'orchestrate') && serverAlive) {
+        const requestId = generateRequestId();
+        const recipeKey = computeRecipeKey(userInput, diagnosis.targetFunc || 'v3.html', '');
+        diagnosis.requestId = requestId;
+        diagnosis.recipeKey = recipeKey;
+        diagnosis.caller = 'continueSession';
         await executeCodeFix(diagnosis);
       }
       _chatBusy = false;
@@ -2216,6 +2226,11 @@ ${speaker.toUpperCase()}の回答（抜粋）: ${firstResponseShort}
 
   // code_fix / orchestrate → daemon送信
   if (diagnosis && (diagnosis.taskType === 'code_fix' || diagnosis.taskType === 'orchestrate') && serverAlive) {
+    const requestId = generateRequestId();
+    const recipeKey = computeRecipeKey(userInput, diagnosis.targetFunc || 'v3.html', '');
+    diagnosis.requestId = requestId;
+    diagnosis.recipeKey = recipeKey;
+    diagnosis.caller = 'continueSession';
     await executeCodeFix(diagnosis);
   }
 
@@ -2226,6 +2241,22 @@ ${speaker.toUpperCase()}の回答（抜粋）: ${firstResponseShort}
 // 重複防止: 直近のcode_fixリクエスト記録
 let _lastCodeFixTime = 0;
 let _lastCodeFixTarget = '';
+
+// recipe実施済み追跡（requestId / recipeKey 単位）
+let completedRecipeKeys = new Set();
+let completedRequestIds = new Set();
+
+function generateRequestId() {
+  return 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
+}
+
+function computeRecipeKey(userText, target, color) {
+  if (!userText) userText = '';
+  if (!target) target = '';
+  if (!color) color = '';
+  const normalized = (userText + '||' + target + '||' + color).toLowerCase().replace(/\s+/g, ' ').trim();
+  return 'key_' + normalized.split('').reduce((h, c) => ((h << 5) - h) + c.charCodeAt(0) | 0, 0).toString(36);
+}
 
 // ─── 失敗分析ノード: 失敗ログ個票読解→原因分類→最小修正方針への言い換え ───
 async function analyzeCodeFixFailure(fixResult, diagnosis, retryCount) {
@@ -2385,6 +2416,11 @@ ${ccResult.matched ? '特定対象: ' + ccResult.matched : '対象未特定'}`;
     appendMinutes(provider, '回答', stripDiagnosisBlock(response), '', threadId);
     appendChatLog('ai', stripDiagnosisBlock(response), provider);
     if (diagnosis && (diagnosis.taskType === 'code_fix' || diagnosis.taskType === 'orchestrate') && serverAlive) {
+      const requestId = generateRequestId();
+      const recipeKey = computeRecipeKey(userInput, diagnosis.targetFunc || 'v3.html', '');
+      diagnosis.requestId = requestId;
+      diagnosis.recipeKey = recipeKey;
+      diagnosis.caller = 'handleImageInput';
       await executeCodeFix(diagnosis);
     }
     return true; // 処理完了
@@ -2396,7 +2432,25 @@ ${ccResult.matched ? '特定対象: ' + ccResult.matched : '対象未特定'}`;
 
 
 async function executeCodeFix(diagnosis) {
-  // 重複防止
+  // caller 必須チェック
+  if (!diagnosis.caller) {
+    appendChatLog('status', '❌ caller未指定のため実行禁止');
+    return null;
+  }
+
+  // requestId / recipeKey チェック
+  const requestId = diagnosis.requestId;
+  const recipeKey = diagnosis.recipeKey;
+  if (requestId && completedRequestIds.has(requestId)) {
+    appendChatLog('status', '✅ 既に反映済み');
+    return null;
+  }
+  if (recipeKey && completedRecipeKeys.has(recipeKey)) {
+    appendChatLog('status', '既に完了済みのため追加実行なし');
+    return null;
+  }
+
+  // 重複防止（従来の10秒ロック）
   const now = Date.now();
   const target = diagnosis.targetFunc || diagnosis.instruction || '';
   if (now - _lastCodeFixTime < 10000 && target === _lastCodeFixTarget) {
@@ -2435,6 +2489,9 @@ async function executeCodeFix(diagnosis) {
     const result = await pollManagedResult(jobId, 300000);
 
     if (result && result.success) {
+      if (diagnosis.recipeKey) completedRecipeKeys.add(diagnosis.recipeKey);
+      if (diagnosis.requestId) completedRequestIds.add(diagnosis.requestId);
+
       setPipelineStep('pipe-codefix', 'complete');
       setPipelineStep('pipe-verify', 'active');
       // CSS修正の場合: 修正前の値を保存→リロード後にcomputedStyleで比較検証
