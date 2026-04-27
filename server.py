@@ -391,6 +391,89 @@ def proxy_gpt():
     return jsonify(body), status
 
 
+# ─── GPT Code Generation ───
+
+@app.route("/api/gpt-code", methods=["POST"])
+def gpt_code():
+    keys = load_keys()
+    key = keys.get("openai", "")
+    if not key:
+        return jsonify({"ok": False, "error": "openai key not configured"}), 500
+
+    data = request.get_json(force=True, silent=True) or {}
+    task = data.get("task", "")
+    target_file = data.get("target_file", "")
+    current_code = data.get("current_code", "")
+    constraints = data.get("constraints", [])
+
+    if not task or not current_code:
+        return jsonify({"ok": False, "error": "task and current_code are required"}), 400
+
+    constraint_text = "\n".join([f"- {c}" for c in constraints])
+    system_prompt = f"""You are a precise code generation assistant. Your task is to generate replacement code for an existing implementation.
+
+RULES:
+- Return ONLY JSON format, no markdown, no explanation
+- Return the difference (old → new) as exact string replacements
+- Do NOT touch code outside the specified range
+- Do NOT rename variables or functions
+- Do NOT add explanatory comments
+- Return valid JSON only
+
+Constraints:
+{constraint_text}"""
+
+    user_prompt = f"""Generate replacement code for the following task:
+
+Task: {task}
+
+Target File: {target_file}
+
+Current Code:
+```
+{current_code}
+```
+
+Return JSON format:
+{{
+  "ok": true,
+  "summary": "What changes you will make",
+  "replace": [
+    {{
+      "old": "existing code to replace",
+      "new": "replacement code"
+    }}
+  ],
+  "notes": []
+}}"""
+
+    try:
+        body, status = _openai_compatible(
+            "https://api.openai.com/v1/chat/completions",
+            data.get("model", "gpt-4o"),
+            system_prompt,
+            user_prompt,
+            key
+        )
+        if status != 200:
+            return jsonify({"ok": False, "error": "OpenAI API error", "details": body}), status
+
+        response_text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not json_match:
+            return jsonify({"ok": False, "error": "GPT did not return valid JSON", "response": response_text}), 502
+
+        try:
+            result = json.loads(json_match.group(0))
+        except json.JSONDecodeError as e:
+            return jsonify({"ok": False, "error": "Invalid JSON from GPT", "details": str(e)}), 502
+
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
 # ─── Grok ───
 
 @app.route("/api/grok", methods=["POST"])
