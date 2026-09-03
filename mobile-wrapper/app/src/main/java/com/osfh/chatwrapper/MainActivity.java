@@ -29,6 +29,11 @@ public class MainActivity extends Activity {
         s.setLoadWithOverviewMode(false);
         s.setUseWideViewPort(false);
 
+        String ua = s.getUserAgentString();
+        if (ua != null) {
+            s.setUserAgentString(ua.replace("; wv", ""));
+        }
+
         CookieManager cookies = CookieManager.getInstance();
         cookies.setAcceptCookie(true);
         cookies.setAcceptThirdPartyCookies(webView, true);
@@ -36,8 +41,8 @@ public class MainActivity extends Activity {
         webView.setWebChromeClient(new WebChromeClient());
         webView.setWebViewClient(new WebViewClient());
 
-        // Diagnostic baseline: no DOM injection, no JavascriptInterface,
-        // no user-agent rewriting. Verify ChatGPT itself remains fully tappable.
+        // Diagnostic baseline plus browser-like UA only.
+        // Still no DOM injection, JavascriptInterface, logger, or file chooser.
         webView.loadUrl("https://chatgpt.com/");
     }
 
