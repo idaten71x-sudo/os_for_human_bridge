@@ -32,32 +32,66 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                injectLogger();
+                injectEnhancements();
             }
         });
         webView.addJavascriptInterface(new LogBridge(), "OSFHLogBridge");
         webView.loadUrl("https://chatgpt.com/");
     }
 
-    private void injectLogger() {
+    private void injectEnhancements() {
         String js = "(() => {" +
-                "if (window.__osfhLoggerInstalled) return;" +
-                "window.__osfhLoggerInstalled = true;" +
+                "if (window.__osfhEnhancedInstalled) return;" +
+                "window.__osfhEnhancedInstalled = true;" +
                 "const seen = new Set();" +
+                "const observed = new WeakMap();" +
+                "const fmt = d => new Intl.DateTimeFormat('ja-JP',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(d);" +
+                "const cleanTitle = t => (t || '').replace(/\\s*[|·-]\\s*ChatGPT\\s*$/i,'').replace(/^ChatGPT\\s*[|·-]?\\s*/i,'').trim();" +
+                "const ensureHeader = () => {" +
+                "let h = document.getElementById('osfh-thread-header');" +
+                "if (!h) {" +
+                "h = document.createElement('div');" +
+                "h.id = 'osfh-thread-header';" +
+                "h.style.cssText = 'position:fixed;top:0;left:56px;right:56px;height:48px;z-index:2147483646;display:flex;align-items:center;justify-content:center;pointer-events:none;font:600 15px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:var(--text-primary,#111);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 8px;box-sizing:border-box;';" +
+                "document.documentElement.appendChild(h);" +
+                "}" +
+                "let title = cleanTitle(document.title);" +
+                "if (!title || title.toLowerCase() === 'chatgpt') {" +
+                "const active = document.querySelector('nav a[aria-current=page], nav [data-active=true], aside a[aria-current=page]');" +
+                "if (active) title = (active.innerText || active.textContent || '').trim();" +
+                "}" +
+                "h.textContent = title || '新しいチャット';" +
+                "};" +
+                "const addStamp = (el, d) => {" +
+                "if (el.querySelector(':scope > .osfh-msg-time')) return;" +
+                "const s = document.createElement('div');" +
+                "s.className = 'osfh-msg-time';" +
+                "s.textContent = fmt(d);" +
+                "s.title = 'この専用アプリがメッセージを確認した時刻';" +
+                "s.style.cssText = 'font-size:11px;line-height:16px;opacity:.48;margin-top:4px;user-select:none;';" +
+                "el.appendChild(s);" +
+                "};" +
                 "const scan = () => {" +
+                "ensureHeader();" +
                 "document.querySelectorAll('[data-message-author-role]').forEach(el => {" +
                 "const role = el.getAttribute('data-message-author-role');" +
                 "if (role !== 'user' && role !== 'assistant') return;" +
-                "const text = (el.innerText || el.textContent || '').trim();" +
+                "let d = observed.get(el);" +
+                "if (!d) { d = new Date(); observed.set(el,d); }" +
+                "addStamp(el,d);" +
+                "const clone = el.cloneNode(true);" +
+                "clone.querySelectorAll('.osfh-msg-time').forEach(x => x.remove());" +
+                "const text = (clone.innerText || clone.textContent || '').trim();" +
                 "if (!text) return;" +
                 "const key = role + '\\n' + text;" +
                 "if (seen.has(key)) return;" +
                 "seen.add(key);" +
-                "OSFHLogBridge.save(JSON.stringify({ts:new Date().toISOString(),role:role,text:text,url:location.href}));" +
+                "OSFHLogBridge.save(JSON.stringify({ts:d.toISOString(),role:role,text:text,url:location.href,title:cleanTitle(document.title)}));" +
                 "});" +
                 "};" +
                 "scan();" +
-                "new MutationObserver(scan).observe(document.documentElement,{subtree:true,childList:true,characterData:true});" +
+                "new MutationObserver(scan).observe(document.documentElement,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['aria-current','data-active']});" +
+                "setInterval(ensureHeader,1000);" +
                 "})();";
         webView.evaluateJavascript(js, null);
     }
