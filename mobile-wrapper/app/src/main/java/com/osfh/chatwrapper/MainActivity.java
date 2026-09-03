@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.os.Bundle;
 import android.view.View;
+import android.view.ViewGroup;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -23,7 +24,7 @@ public class MainActivity extends Activity {
         webView = new WebView(this);
         webView.setFocusable(true);
         webView.setFocusableInTouchMode(true);
-        webView.setDescendantFocusability(View.FOCUS_AFTER_DESCENDANTS);
+        webView.setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
         webView.requestFocus(View.FOCUS_DOWN);
         setContentView(webView);
 
