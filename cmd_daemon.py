@@ -118,6 +118,8 @@ def find_new_requests():
                 "meta_file": meta_file,
                 "md_file": md_files[0],
                 "img_file": img_file if img_file.exists() else None,
+                # server管理JOB（リトライはserver側が引き継ぎ付きで行う）
+                "managed": bool(meta.get("managed", False)),
             })
         except Exception as e:
             print(f"[daemon] meta読み取りエラー: {e}")
@@ -1016,7 +1018,9 @@ def execute_request(req, error_feedback=""):
     import time as _time
     now = _time.time()
     inst_hash = _instruction_hash(instruction)
-    if inst_hash in _last_exec and now - _last_exec[inst_hash] < 17:
+    # server管理の継続JOB（引き継ぎ付きの正当な続行）は重複扱いしない
+    is_continuation = '【継続JOB:' in instruction
+    if not is_continuation and inst_hash in _last_exec and now - _last_exec[inst_hash] < 17:
         elapsed = now - _last_exec[inst_hash]
         print(f"[daemon] 重複スキップ: {req_id} (同一案件[{inst_hash}]へ{elapsed:.0f}秒以内)")
         # 結果ファイルを書いてからスキップ（HTMLのポーリングがpendingのまま止まるのを防ぐ）
@@ -1032,7 +1036,9 @@ def execute_request(req, error_feedback=""):
         return False
     _last_exec[inst_hash] = now
     if error_feedback:
-        instruction += f"\n\n【前回の修正が失敗した理由】\n{error_feedback}\nこの問題を回避して修正してください。"
+        instruction += (f"\n\n【前回の修正が失敗した理由】\n{error_feedback}\n"
+                        "前回特定済みの箇所・調査結果は再調査せずに使い、上記の未達部分だけを修正してください。"
+                        "前回と同じ編集の繰り返しは禁止。")
     target_path = BRIDGE_DIR / target
 
     # status が 'reverted' の場合は処理をスキップ
@@ -1686,9 +1692,39 @@ def process_identify(req):
         return False
 
 
+def _read_failure(req_id):
+    """失敗結果から (理由, 実施内容要約) を取得"""
+    result_file = CODE_RESULT_DIR / f"{req_id}_result.json"
+    if result_file.exists():
+        try:
+            rdata = json.loads(result_file.read_text(encoding="utf-8"))
+            return rdata.get("audit", {}).get("reason", ""), str(rdata.get("output", ""))[:400]
+        except Exception:
+            pass
+    return "", ""
+
+
+def _failure_signature(reason):
+    """失敗理由から数値・空白を除いた路線シグネチャ（同一原因の判定用）"""
+    import re
+    sig = re.sub(r'[0-9０-９]+', '#', reason or "")
+    return re.sub(r'\s+', '', sig)[:60]
+
+
+def _build_feedback(reason, output):
+    """次回に引き継ぐ失敗情報（未達条件 + 前回の実施内容 = 禁止ルート）"""
+    fb = f"未達条件: {reason}"
+    if output:
+        fb += f"\n前回の実施内容（同じことの繰り返し禁止）: {output}"
+    return fb
+
+
 def poll_loop():
-    """メインポーリングループ（失敗時はエラーフィードバック付きリトライ最大3回）"""
-    _retry_queue = []  # [(req, error_feedback, retry_count)]
+    """メインポーリングループ
+    失敗時は未達条件・前回実施内容を引き継いで最大3回まで続行。
+    同一原因で失敗が続いた場合はそれ以上やり直さない（同一route再実行禁止）。
+    server管理JOB（managed）はserver側が引き継ぎ/上位判定付きでリトライするので、ここでは再実行しない。"""
+    _retry_queue = []  # [(req, error_feedback, retry_count, failure_signature)]
     while True:
         try:
             # identifyリクエスト（画像UI特定）の処理
@@ -1697,7 +1733,7 @@ def poll_loop():
 
             # リトライキューの処理
             new_retry = []
-            for req, feedback, count in _retry_queue:
+            for req, feedback, count, prev_sig in _retry_queue:
                 if count >= 3:
                     print(f"[daemon] リトライ上限到達: {req['requestId']}")
                     _processed.add(req["requestId"])
@@ -1706,16 +1742,13 @@ def poll_loop():
                 _processed.discard(req["requestId"])
                 result = execute_request(req, error_feedback=feedback)
                 if not result:
-                    # 失敗結果から理由を取得
-                    result_file = CODE_RESULT_DIR / f"{req['requestId']}_result.json"
-                    reason = ""
-                    if result_file.exists():
-                        try:
-                            rdata = json.loads(result_file.read_text(encoding="utf-8"))
-                            reason = rdata.get("audit", {}).get("reason", "")
-                        except Exception:
-                            pass
-                    new_retry.append((req, reason, count + 1))
+                    reason, output = _read_failure(req["requestId"])
+                    sig = _failure_signature(reason)
+                    if sig and sig == prev_sig:
+                        print(f"[daemon] 同一原因で再失敗 → 再実行打ち切り: {req['requestId']} (理由: {reason[:80]})")
+                        _processed.add(req["requestId"])
+                        continue
+                    new_retry.append((req, _build_feedback(reason, output), count + 1, sig))
             _retry_queue = new_retry
 
             # 新規リクエストの処理
@@ -1723,17 +1756,12 @@ def poll_loop():
             for req in requests:
                 result = execute_request(req)
                 if not result:
-                    # 失敗結果から理由を取得してリトライキューに追加
-                    result_file = CODE_RESULT_DIR / f"{req['requestId']}_result.json"
-                    reason = ""
-                    if result_file.exists():
-                        try:
-                            rdata = json.loads(result_file.read_text(encoding="utf-8"))
-                            reason = rdata.get("audit", {}).get("reason", "")
-                        except Exception:
-                            pass
+                    if req.get("managed"):
+                        # server側が引き継ぎ付きで継続JOBを出す。daemonで重ねてやり直さない
+                        continue
+                    reason, output = _read_failure(req["requestId"])
                     if reason and "JSON抽出不可" not in reason:
-                        _retry_queue.append((req, reason, 1))
+                        _retry_queue.append((req, _build_feedback(reason, output), 1, _failure_signature(reason)))
                         print(f"[daemon] リトライキューに追加: {req['requestId']} (理由: {reason[:80]})")
         except Exception as e:
             print(f"[daemon] ポーリングエラー: {e}")

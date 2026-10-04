@@ -1113,6 +1113,125 @@ DEFAULT_TARGET_FILE = str(BRIDGE_DIR / "os_for_human_pipeline_v3.html")
 # ─── 管理型実行API（リトライ・進捗をserver側で管理、HTML軽量化用）───
 _managed_jobs = {}  # jobId -> {status, requestId, retries, maxRetries, progressMessage, ...}
 
+# 再投入ポリシー:
+#   失敗したら新品JOBで同じ指示をやり直す、は禁止。
+#   前JOBの確定事項・変更済み箇所・未達条件を引き継ぎ、未達だけを続行させる。
+#   同一路線FAIL / false-success が続いたら再実行せず、上位モデルに「再実行に意味があるか」を判定させる。
+RETRY_JUDGE_MODEL = os.environ.get("RETRY_JUDGE_MODEL", "claude-opus-4-20250514")
+
+
+def _failure_signature(reason: str) -> str:
+    """失敗理由から数値・空白を除いた路線シグネチャ（同一原因の判定用）"""
+    sig = re.sub(r'[0-9０-９]+', '#', reason or "")
+    sig = re.sub(r'\s+', '', sig)
+    return sig[:60]
+
+
+def _summarize_attempt(rid: str, model: str, result: dict) -> dict:
+    """1回分のJOB結果を引き継ぎ用に要約する"""
+    audit = result.get("audit", {}) or {}
+    passed = bool(audit.get("passed", False))
+    success = bool(result.get("success", False))
+    file_changed = bool(result.get("file_changed", False))
+    reason = str(audit.get("reason") or result.get("error") or "不明")
+    return {
+        "requestId": rid,
+        "model": model,
+        "success": success,
+        "auditPassed": passed,
+        "fileChanged": file_changed,
+        # 変更を出したのに監査で落ちた / successを名乗って監査不合格 = false-success
+        "falseSuccess": (file_changed or success) and not passed,
+        "reason": reason[:300],
+        "signature": _failure_signature(reason),
+        "output": str(result.get("output", ""))[:800],
+    }
+
+
+def _is_same_route_repeat(attempts: list) -> bool:
+    """直近の失敗が同一路線の繰り返しか（同一原因FAIL or false-success連続）"""
+    if len(attempts) < 2:
+        return False
+    last, prev = attempts[-1], attempts[-2]
+    if last["signature"] and last["signature"] == prev["signature"]:
+        return True
+    if last["falseSuccess"] and prev["falseSuccess"]:
+        return True
+    return False
+
+
+def _judge_retry_worth(instruction: str, target_file: str, attempts: list) -> dict:
+    """上位モデルに「再実行に意味があるか」を判定させる。
+    判定不能（キー無し・API失敗）の場合は資源を燃やさないよう STOP を返す。"""
+    keys = load_keys()
+    key = keys.get("anthropic", "")
+    if not key:
+        return {"verdict": "STOP", "reason": "上位判定不可（anthropic key未設定）→ 再実行せず停止", "remaining": ""}
+    history = "\n".join(
+        f"- {a['requestId']} model={a['model']} fileChanged={a['fileChanged']} "
+        f"auditPassed={a['auditPassed']} falseSuccess={a['falseSuccess']}\n  理由: {a['reason']}\n  実施内容: {a['output'][:300]}"
+        for a in attempts
+    )
+    system = (
+        "あなたはコード修正JOBの再投入可否を判定する上位判定者。"
+        "同じ目的・同じ対象で同一路線の失敗が続いている。"
+        "もう一度実行して結果が変わる根拠があるかだけを判定しろ。根拠がなければSTOP。"
+        "出力はJSONのみ: {\"verdict\": \"CONTINUE\"|\"STOP\", \"reason\": \"...\", "
+        "\"remaining\": \"CONTINUEの場合のみ: 未達条件だけを満たすための具体的な残作業（前回と違う路線）\"}"
+    )
+    user = f"■目的\n{instruction[:1500]}\n\n■対象ファイル\n{target_file}\n\n■これまでの試行\n{history}"
+    try:
+        res = _retry_post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01"},
+            json={"model": RETRY_JUDGE_MODEL, "max_tokens": 1024, "system": system,
+                  "messages": [{"role": "user", "content": user}]},
+            timeout=TIMEOUT,
+        )
+        text = "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text")
+        m = re.search(r'\{.*\}', text, re.S)
+        verdict = json.loads(m.group(0)) if m else {}
+        if verdict.get("verdict") not in ("CONTINUE", "STOP"):
+            return {"verdict": "STOP", "reason": f"上位判定の応答が不正 → 停止: {text[:120]}", "remaining": ""}
+        return {"verdict": verdict["verdict"], "reason": str(verdict.get("reason", ""))[:300],
+                "remaining": str(verdict.get("remaining", ""))[:1500]}
+    except Exception as e:
+        return {"verdict": "STOP", "reason": f"上位判定エラー → 再実行せず停止: {e}", "remaining": ""}
+
+
+def _build_continuation_instruction(instruction: str, attempts: list, remaining: str = "") -> str:
+    """前JOBの確定事項・変更済み箇所・未達条件を引き継いだ継続指示を作る（新品JOBにしない）"""
+    last = attempts[-1]
+    tried = "\n".join(f"- [{a['requestId']}] {a['output'][:300] or '(出力なし)'} → 不合格理由: {a['reason'][:150]}"
+                       for a in attempts)
+    if last["fileChanged"]:
+        state = ("前JOBの変更は監査不合格のためロールバック済み。対象ファイルの現在内容が正。"
+                 "ただし前JOBで特定済みの修正箇所・調査結果は再調査せずそのまま使え。")
+    else:
+        state = "前JOBではファイル変更なし。前JOBで特定済みの箇所・調査結果は再調査せずそのまま使え。"
+    parts = [
+        "【継続JOB: 新規JOBではない。前JOBの続きとして未達部分だけ処理しろ】",
+        "",
+        "■ 前JOBの状態（確定事項・変更済み箇所）",
+        state,
+        "",
+        "■ 未達条件（これだけを満たせ）",
+        last["reason"],
+    ]
+    if remaining:
+        parts += ["", "■ 上位判定による残作業", remaining]
+    parts += [
+        "",
+        "■ 禁止ルート（同一route再探索禁止）",
+        tried,
+        "上記と同じ編集・同じ探索をやり直すな。全体の再調査・再設計も禁止。未達条件に必要な最小変更だけ行え。",
+        "",
+        "■ 元の目的（参照用。最初からやり直す指示ではない）",
+        instruction,
+    ]
+    return "\n".join(parts)
+
+
 @app.route("/api/code/managed-execute", methods=["POST"])
 def managed_execute():
     """修正依頼を受け付け、リトライ含めてserver側で管理する"""
@@ -1151,6 +1270,9 @@ def managed_execute():
             "targetMtime": target_mtime,
             "hasImages": False,
             "model": model,
+            "managed": True,  # リトライはserver側で管理（daemon側で独自リトライしない）
+            "jobId": job_id,
+            "attempt": 0,
             "requestedAt": datetime.datetime.now().isoformat(),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1166,6 +1288,8 @@ def managed_execute():
             "progressMessage": "修正リクエスト送信済み。daemonが処理中...",
             "success": None,
             "failureSummary": None,
+            "attempts": [],      # 各JOBの要約（引き継ぎ用）
+            "judgment": None,    # 上位モデルの再実行判定
             "createdAt": datetime.datetime.now().isoformat(),
         }
 
@@ -1214,36 +1338,63 @@ def managed_execute():
                         _managed_jobs[jid]["progressMessage"] = "修正完了"
                         return
                     else:
-                        # 失敗 → リトライ可能か判断
-                        reason = audit.get("reason", result.get("error", "不明"))
+                        # 失敗 → 新品JOBで再実行せず、引き継ぎ付き継続 or 上位判定
+                        attempts = _managed_jobs[jid]["attempts"]
+                        attempts.append(_summarize_attempt(current_rid, _managed_jobs[jid]["model"], result))
+                        last = attempts[-1]
+                        reason = last["reason"]
                         _managed_jobs[jid]["retries"] = attempt + 1
-                        if attempt < max_r:
-                            # リトライ: 新しいrequestIdでリクエスト再送
-                            _managed_jobs[jid]["progressMessage"] = f"失敗({reason[:40]})→ 戦略変更して再試行中..."
-                            retry_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                            retry_rid = f"FIX-{retry_ts}"
-                            retry_model = "opus" if attempt == 0 else mdl
-                            retry_inst = inst + f"\n\n【前回失敗: {reason[:200]}】\n前回と同じやり方は禁止。別の方法で修正しろ。"
-                            retry_dest = CODE_REQ_DIR / f"{retry_ts}_{retry_rid}_request.md"
-                            retry_dest.write_text(
-                                f"# Code Request {retry_ts} (retry {attempt+1})\nrequestId: {retry_rid}\ntargetFile: {tgt}\n\n{retry_inst}\n",
-                                encoding="utf-8"
-                            )
-                            retry_meta = CODE_REQ_DIR / f"{retry_rid}_meta.json"
-                            retry_meta.write_text(json.dumps({
-                                "requestId": retry_rid, "targetFile": tgt,
-                                "targetMtime": 0.0, "hasImages": False,
-                                "model": retry_model,
-                                "requestedAt": datetime.datetime.now().isoformat(),
-                            }, ensure_ascii=False, indent=2), encoding="utf-8")
-                            _managed_jobs[jid]["requestId"] = retry_rid
-                            continue
-                        else:
+
+                        def _finish_fail(summary):
                             _managed_jobs[jid]["status"] = "done"
                             _managed_jobs[jid]["success"] = False
-                            _managed_jobs[jid]["failureSummary"] = reason[:200]
-                            _managed_jobs[jid]["progressMessage"] = f"修正失敗: {reason[:60]}"
+                            _managed_jobs[jid]["failureSummary"] = summary[:300]
+                            _managed_jobs[jid]["progressMessage"] = f"修正失敗: {summary[:60]}"
+
+                        if attempt >= max_r:
+                            _finish_fail(reason)
                             return
+
+                        remaining = ""
+                        if _is_same_route_repeat(attempts):
+                            # 同一路線FAIL / false-success連続 → 再実行ではなく上位モデルに意味判定
+                            _managed_jobs[jid]["progressMessage"] = "同一路線の失敗が連続 → 再実行に意味があるか上位判定中..."
+                            judgment = _judge_retry_worth(inst, tgt, attempts)
+                            _managed_jobs[jid]["judgment"] = judgment
+                            print(f"[server] {jid} 上位判定: {judgment['verdict']} - {judgment['reason'][:80]}")
+                            if judgment["verdict"] != "CONTINUE":
+                                _finish_fail(f"上位判定で再実行停止: {judgment['reason']} / 最終失敗: {reason}")
+                                return
+                            remaining = judgment.get("remaining", "")
+
+                        # 継続JOB: 確定事項・変更済み箇所・未達条件を引き継ぎ、未達だけ続行
+                        _managed_jobs[jid]["progressMessage"] = f"失敗({reason[:40]})→ 未達部分のみ継続中..."
+                        retry_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        retry_rid = f"FIX-{retry_ts}"
+                        retry_inst = _build_continuation_instruction(inst, attempts, remaining)
+                        retry_mtime = 0.0
+                        try:
+                            if os.path.exists(tgt):
+                                retry_mtime = os.path.getmtime(tgt)
+                        except Exception:
+                            pass
+                        retry_dest = CODE_REQ_DIR / f"{retry_ts}_{retry_rid}_request.md"
+                        retry_dest.write_text(
+                            f"# Code Request {retry_ts} (continuation {attempt+1} of {current_rid})\nrequestId: {retry_rid}\ntargetFile: {tgt}\nmtime: {retry_mtime}\n\n{retry_inst}\n",
+                            encoding="utf-8"
+                        )
+                        retry_meta = CODE_REQ_DIR / f"{retry_rid}_meta.json"
+                        retry_meta.write_text(json.dumps({
+                            "requestId": retry_rid, "targetFile": tgt,
+                            "targetMtime": retry_mtime, "hasImages": False,
+                            # 同じモデルで未達分だけ続行（重いモデルで最初からやり直さない）
+                            "model": mdl,
+                            "managed": True, "jobId": jid, "attempt": attempt + 1,
+                            "continuationOf": current_rid,
+                            "requestedAt": datetime.datetime.now().isoformat(),
+                        }, ensure_ascii=False, indent=2), encoding="utf-8")
+                        _managed_jobs[jid]["requestId"] = retry_rid
+                        continue
                 else:
                     # タイムアウト
                     if attempt < max_r:
@@ -1277,6 +1428,8 @@ def managed_status(job_id):
         "success": job["success"],
         "failureSummary": job["failureSummary"],
         "retries": job["retries"],
+        "attempts": job.get("attempts", []),
+        "judgment": job.get("judgment"),
     })
 
 
