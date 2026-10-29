@@ -6712,12 +6712,17 @@ HANDOFF_ID: ${handoffId}
   // 2026-10-29: ChatGPT can render a six-column answer table in the DOM
   // without preserving the original Markdown pipe characters in metadata.
   // Extract ONLY the newest assistant message's six-column audit table.
-  function articleGuardDomAuditTable() {
+  // v18（2026-10-29）：画面の最後の答えの文字だけを比べる形にする
+  function articleGuardLetters(text) { return String(text || "").replace(/<[^>]+>/g, "").replace(/[^\p{L}\p{N}]+/gu, ""); }
+  function articleGuardDomAuditTable(expectTail = "") {
     try {
       if (typeof document === "undefined") return "";
+      if (findStopButton()) return "";   // v18：GPTが書いている途中の表（書きかけの行）は読まない
       const turns = Array.from(document.querySelectorAll('main [data-message-author-role="assistant"]'));
       const last = turns[turns.length - 1];
       if (!last) return "";
+      // v18：画面の最後の答えが、記録で読んだ答えと同じ時だけ使う（前の回の表を今回の表として読まない）
+      if (expectTail && !articleGuardLetters(last.innerText || last.textContent || "").includes(expectTail)) return "";
       const tables = last.querySelectorAll('table, [role="table"]');
       for (const table of tables) {
         const rows = Array.from(table.querySelectorAll('tr, [role="row"]')).map(r =>
@@ -6745,11 +6750,11 @@ HANDOFF_ID: ${handoffId}
     path.reverse();
     let start = 0;
     for (let i = path.length - 1; i >= 0; i--) if (path[i].message?.author?.role === "user") { start = i + 1; break; }
-    let answer = "", drive = "";
+    let answer = "", drive = "", lastText = "";
     const hidden = [];
     for (const node of path.slice(start)) {
       const m = node.message, c = m?.content || {};
-      if (m?.author?.role === "assistant" && (m.recipient || "all") === "all" && c.content_type === "text") answer += (c.parts || []).join("\n") + "\n";
+      if (m?.author?.role === "assistant" && (m.recipient || "all") === "all" && c.content_type === "text") { lastText = (c.parts || []).join("\n"); answer += lastText + "\n"; }
       else if (m?.author?.role === "assistant" && (m.recipient || "all") !== "all") {
         drive += articleGuardDriveWriteText(c, m.recipient);
         const h = articleGuardHiddenWrite(c);
@@ -6771,7 +6776,8 @@ HANDOFF_ID: ${handoffId}
     // If the assistant's structured table is absent from metadata, use the
     // current visible DOM table instead of retrying a correctly formed answer.
     if (!/^\s*\|\s*No\.?\s*\|\s*監査項目\s*\|\s*結果\s*\|/m.test(answer)) {
-      const domTable = articleGuardDomAuditTable();
+      const tail = articleGuardLetters(lastText).slice(-12);
+      const domTable = tail ? articleGuardDomAuditTable(tail) : "";
       if (domTable) answer += "\n" + domTable + "\n";
     }
     return answer;
@@ -7505,6 +7511,18 @@ HANDOFF_ID: ${handoffId}
     return !!last && last.author?.role === "assistant" && (last.recipient || "all") === "all"
       && last.content?.content_type === "text" && last.end_turn !== false;
   }
+  // v18（2026-10-29）Dan「表が読めなかったので同じ項目をもう一度、って毎回出る」
+  // 会話 6ae251cf：GPTは依頼を受けるとまず短い途中経過（「確認します」等）を出し、数分作業してから表を出す。
+  // 記録では途中経過も「書き終わった文章の答え」に見えるため、見張りは表のない途中経過を読み、画面の前の回の表や
+  // 書きかけの表で補って「読めない」と判定していた（No.1-1が入っている／3-2の引用が無い／14-1に左右対応が無い）。
+  // 表が読めない時の判定は、同じ答えのまま一定時間動かないのを確かめてから出す。
+  const ARTICLE_GUARD_FORMAT_SETTLE_MS = 120000;
+  function articleGuardUnsureRead(d) {
+    if (!d || !d.send || !d.state) return false;
+    const why = String(d.blockReason || "");
+    return d.state.kind === "format" || (d.gaveUp && /読める表/.test(why)) || /読める表が出ず/.test(why)
+      || (d.state.kind === "needtext" && !d.state.danSaid);
+  }
   async function articleGuardEvaluate(conversationId, conv) {
     if (!articleGuardAnswerFinished(conv)) {
       const last = conv?.mapping?.[conv?.current_node]?.message;
@@ -7524,7 +7542,18 @@ HANDOFF_ID: ${handoffId}
     }
     if(before&&before.readNode&&before.readNode===conv?.current_node) return;   // もう読んだ答え（別のタブが先に読んだ）
     const d=anchorId?articleGuardDecide(before,answer,Date.now(),anchorId,articleGuardAnchorIsAudit(conv,anchorId),articleGuardHumanTextOf(conv,anchorId)):{state:null,send:false,gaveUp:false};
-    if(d.state) d.state=Object.assign({},d.state,{readNode:conv?.current_node||""});
+    // v18：表が読めない答えは、GPTが途中経過を出しただけかもしれない。同じ答えのまま2分動かないのを見てから差し戻す
+    if(before&&articleGuardUnsureRead(d)){
+      const node=conv?.current_node||"", w=before.formatWait;
+      if(!w||w.node!==node){
+        articleGuardSave(conversationId,Object.assign({},before,{formatWait:{node,at:Date.now()}}));
+        articleGuardLastDomSeen="";   // 画面が変わらなくても後読みでもう一度読む
+        osfhEvent("article_guard_format_wait",`表が読めない答え（${String(d.blockReason||"").slice(0,60)}）→ 途中経過かもしれないので待つ ${node}`);
+        return;
+      }
+      if(Date.now()-w.at<ARTICLE_GUARD_FORMAT_SETTLE_MS||findStopButton()){ articleGuardLastDomSeen=""; return; }
+    }
+    if(d.state) d.state=Object.assign({},d.state,{readNode:conv?.current_node||"",formatWait:null});
     if(d.blockReason) osfhEvent("article_guard_blocked_or_review",d.blockReason);
     if(d.gaveUp) osfhEvent("article_guard_gave_up",`batch ${before?.batch||0}: ${d.blockReason||""}`);
     if(d.send) await articleGuardTrySend(conversationId,d.state);
@@ -7599,7 +7628,7 @@ HANDOFF_ID: ${handoffId}
     } catch(error) {articleGuardNoteError(error);osfhEvent("article_guard_error",error?.message||String(error));}
     finally {articleGuardBusy=false;}
   }
-  try {if(typeof window!=="undefined") window.__osfhArticleGuard={articleGuardSplit,articleGuardHasArticle,articleGuardChecklistItems,articleGuardHasChecklist,articleGuardReadAnswer,articleGuardDecide,articleGuardText,articleGuardBatchParse,articleGuardHasBreakProblem,articleGuardBatchItems,articleGuardNewest,ARTICLE_GUARD_BATCHES,articleGuardDriveWriteText,articleGuardLooksLikeArticle,articleGuardReadAnswer,articleGuardOutsideOnly,articleGuardUnreadAnswer,articleGuardBreakDetail,articleGuardMarkdownAsHtml,articleGuardAnswerFinished,articleGuardEvidenceInSource,articleGuardAnchorIsAudit,articleGuardAnchorIsForwarded,articleGuardNormalizeRules,articleGuardBuiltinRules,articleGuardBatchesOf,articleGuardMaxTotal,articleGuardWaitList,articleGuardNotes,articleGuardBigPerSend,articleGuardHiddenWrite,articleGuardHiddenNames,articleGuardCodeBlockArticle,articleGuardResumeInstead,articleGuardLastUserText,articleGuardSandboxLinks,articleGuardLabelSame,articleGuardQuoteKey,articleGuardStructuralMeasure,articleGuardDomAuditTable,articleGuardPgOf,articleGuardLang,articleGuardTitleOf,articleGuardSimilarity,articleGuardMakeTarget,articleGuardIsTarget,articleGuardPickArticle,articleGuardWantsSwitch,articleGuardTargetLine,setRulesForTest:(set)=>{articleGuardSheetRules=articleGuardNormalizeRules(set);}};}catch(_){}
+  try {if(typeof window!=="undefined") window.__osfhArticleGuard={articleGuardSplit,articleGuardHasArticle,articleGuardChecklistItems,articleGuardHasChecklist,articleGuardReadAnswer,articleGuardDecide,articleGuardText,articleGuardBatchParse,articleGuardHasBreakProblem,articleGuardBatchItems,articleGuardNewest,ARTICLE_GUARD_BATCHES,articleGuardDriveWriteText,articleGuardLooksLikeArticle,articleGuardReadAnswer,articleGuardOutsideOnly,articleGuardUnreadAnswer,articleGuardBreakDetail,articleGuardMarkdownAsHtml,articleGuardAnswerFinished,articleGuardEvidenceInSource,articleGuardAnchorIsAudit,articleGuardAnchorIsForwarded,articleGuardNormalizeRules,articleGuardBuiltinRules,articleGuardBatchesOf,articleGuardMaxTotal,articleGuardWaitList,articleGuardNotes,articleGuardBigPerSend,articleGuardHiddenWrite,articleGuardHiddenNames,articleGuardCodeBlockArticle,articleGuardResumeInstead,articleGuardLastUserText,articleGuardSandboxLinks,articleGuardLabelSame,articleGuardQuoteKey,articleGuardStructuralMeasure,articleGuardDomAuditTable,articleGuardPgOf,articleGuardLang,articleGuardTitleOf,articleGuardSimilarity,articleGuardMakeTarget,articleGuardIsTarget,articleGuardPickArticle,articleGuardWantsSwitch,articleGuardTargetLine,articleGuardUnsureRead,articleGuardLetters,articleGuardEvaluate,setRulesForTest:(set)=>{articleGuardSheetRules=articleGuardNormalizeRules(set);}};}catch(_){}
   setInterval(()=>{maybeArticleGuard().catch(()=>{});},ARTICLE_GUARD_SCAN_MS);
   // === OSFH_ARTICLE_CHECKLIST_GUARD_END ===
 })();

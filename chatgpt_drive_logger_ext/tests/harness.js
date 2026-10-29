@@ -6,8 +6,8 @@ function load(path) {
   const store = {};
   const ctx = {
     console: { log: noop, warn: noop, error: noop, info: noop, debug: noop },
-    setTimeout: () => 0, clearTimeout: noop, setInterval: () => 0, clearInterval: noop,
-    location: { href: "https://chatgpt.com/c/test", pathname: "/c/test", hostname: "chatgpt.com" },
+    setTimeout: (fn, ms) => setTimeout(fn, Math.min(Number(ms) || 0, 5)), clearTimeout, setInterval: () => 0, clearInterval: noop,
+    location: { href: "https://chatgpt.com/c/6ae251cf-test", pathname: "/c/6ae251cf-test", hostname: "chatgpt.com", origin: "https://chatgpt.com" },
     document: Object.assign(elem(), { readyState: "complete", hidden: false, body: elem(), documentElement: elem(), head: elem(), createElement: elem, getElementById: () => null, addEventListener: noop }),
     localStorage: { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); }, removeItem: k => { delete store[k]; } },
     chrome: { runtime: { sendMessage: noop, onMessage: { addListener: noop }, getURL: x => x, id: "x" }, storage: { local: { get: (k, cb) => cb && cb({}), set: (o, cb) => cb && cb() }, onChanged: { addListener: noop } } },
@@ -21,6 +21,8 @@ function load(path) {
   ctx.addEventListener = noop; ctx.removeEventListener = noop;
   vm.createContext(ctx);
   vm.runInContext(fs.readFileSync(path, "utf8"), ctx, { filename: path });
-  return ctx.window.__osfhArticleGuard;
+  const g = ctx.window.__osfhArticleGuard;
+  if (g) g.__ctx = ctx;   // 試験から localStorage・画面を触るため
+  return g;
 }
 module.exports = { load };
